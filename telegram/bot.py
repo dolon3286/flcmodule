@@ -91,6 +91,15 @@ SUPPORTED_DOMAINS = [
     "youtube.com",
     "youtu.be",
     "music.youtube.com",
+    "amazon.com",
+    "music.amazon.com",
+    "music.amazon.in",
+    "music.amazon.co.uk",
+    "music.amazon.de",
+    "amazon.in",
+    "amazon.co.uk",
+    "amazon.de",
+    "amzn.to",
 ]
 
 FILENAME_FORMAT_PRESETS = {
@@ -617,7 +626,7 @@ async def run_spotiflac(url: str, job_cfg: dict) -> None:
 download_queue: asyncio.Queue = asyncio.Queue()
 _queue_list: list[dict] = []
 _queue_id_counter = 0
-current_task: dict | None = None
+current_tasks = set()
 
 
 def _next_queue_id() -> int:
@@ -672,11 +681,12 @@ async def send_result(chat_id: int, message_id: int, organized, duplicates, erro
 
 
 async def download_worker():
-    global current_task
+    global current_tasks
     while True:
         job = await download_queue.get()
         _queue_list[:] = [x for x in _queue_list if x["id"] != job["id"]]
-        current_task = job
+        job_id = job["id"]
+        current_tasks.add(job_id)
 
         try:
             await safe_edit(
@@ -709,7 +719,7 @@ async def download_worker():
                 job["chat_id"], job["message_id"], f"❌ Error: {he(str(e))}"
             )
         finally:
-            current_task = None
+            current_tasks.discard(job_id)
             download_queue.task_done()
 
 
@@ -719,7 +729,8 @@ async def enqueue_job(chat_id: int, message_id: int, job_cfg: dict) -> int:
     _queue_list.append(job)
     await download_queue.put(job)
     position = download_queue.qsize()
-    if current_task is not None or position > 1:
+    max_concurrent = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", 5))
+    if len(current_tasks) >= max_concurrent or position > 1:
         await safe_edit(
             chat_id, message_id, f"⏳ Added to queue (position #{position}, ID {qid})."
         )
@@ -1170,12 +1181,12 @@ async def cmd_search(message: types.Message):
 async def cmd_queue(message: types.Message):
     if not is_authorized(message.from_user.id):
         return
-    if not _queue_list and current_task is None:
+    if not _queue_list and not current_tasks:
         await message.answer("✅ The queue is empty.")
         return
     lines = ["📋 <b>Download status</b>\n"]
-    if current_task is not None:
-        lines.append(f"▶️ Running: <code>{he(current_task['url'])}</code>\n")
+    if current_tasks:
+        lines.append(f"▶️ Running {len(current_tasks)} job(s)\n")
     if _queue_list:
         lines.append("⏸️ Waiting:")
         for item in _queue_list:
@@ -1207,7 +1218,7 @@ async def cmd_cancel(message: types.Message):
 async def cmd_stop(message: types.Message):
     if not is_authorized(message.from_user.id):
         return
-    if current_task is None:
+    if not current_tasks:
         await message.answer(
             "Nothing is downloading right now (note: a running job can't be interrupted mid-way, only queued ones)."
         )
@@ -1593,7 +1604,9 @@ async def cb_confirm(call: types.CallbackQuery):
 
 async def main():
     db_init()
-    asyncio.create_task(download_worker())
+    max_concurrent_downloads = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", 5))
+    for _ in range(max_concurrent_downloads):
+        asyncio.create_task(download_worker())
     print("🤖 SpotiFLAC Bot started and listening...")
     await dp.start_polling(bot)
 

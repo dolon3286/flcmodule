@@ -74,7 +74,7 @@ class NetworkManager:
             client = cls._async_clients.get(loop_id)
             if client is None:
                 limits = httpx.Limits(max_keepalive_connections=30, max_connections=100)
-                client = httpx.AsyncClient(limits=limits, timeout=30.0)
+                client = httpx.AsyncClient(limits=limits, timeout=30.0, follow_redirects=True)
                 cls._async_clients[loop_id] = client
         return client
 

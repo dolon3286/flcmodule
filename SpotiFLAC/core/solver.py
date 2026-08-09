@@ -354,7 +354,7 @@ def build_chromium_options(*, hidden: bool = True) -> ChromiumOptions:
 
     options = ChromiumOptions()
     options.binary_location = _find_chrome()
-    options.headless = False
+    options.headless = True
     # A persistent profile dir. pydoll doesn't have a first-class
     # `user_data_dir` option (yet), so it's passed as a raw Chromium flag,
     # same as nodriver did internally.
