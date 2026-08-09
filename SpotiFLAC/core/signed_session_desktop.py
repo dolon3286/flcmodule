@@ -134,7 +134,7 @@ def community_session_valid(record: CommunitySessionRecord) -> bool:
 
 def ensure_community_session() -> CommunitySessionRecord:
     # Usiamo acquire con timeout al posto di "with community_session_mu:"
-    if not community_session_mu.acquire(timeout=30):
+    if not community_session_mu.acquire(timeout=600):
         raise RuntimeError("Lock community_session_mu occupato da troppo tempo, salto.")
 
     try:
