@@ -43,6 +43,12 @@ from aiogram.enums import ParseMode
 from aiogram.filters import Command
 from aiogram.types import FSInputFile, InlineKeyboardButton, InlineKeyboardMarkup
 
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
+import pickle
+
 from SpotiFLAC import AsyncSpotiFLAC
 
 # ─── CONFIGURATION ───────────────────────────────────────────────────
@@ -64,6 +70,8 @@ DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", "/app/downloads")
 CONFIG_PATH = str(DATA_DIR / "config.json")
 DB_PATH = str(DATA_DIR / "library.db")
 CHATIDS_PATH = str(DATA_DIR / "chat_ids.json")
+TOKEN_PICKLE_PATH = str(DATA_DIR / "token.pickle")
+CREDENTIALS_JSON_PATH = str(DATA_DIR / "credentials.json")
 
 os.makedirs(DOWNLOAD_DIR, exist_ok=True)
 
@@ -126,6 +134,94 @@ ALLOWED_USER_IDS = _allowed_user_ids()
 def is_authorized(user_id: int) -> bool:
     return ALLOWED_USER_IDS is None or user_id in ALLOWED_USER_IDS
 
+
+# ─── GOOGLE DRIVE INTEGRATION ─────────────────────────────────────────
+
+def get_gdrive_service():
+    creds = None
+    if os.path.exists(TOKEN_PICKLE_PATH):
+        with open(TOKEN_PICKLE_PATH, 'rb') as token:
+            creds = pickle.load(token)
+    if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+            creds.refresh(Request())
+            with open(TOKEN_PICKLE_PATH, 'wb') as token:
+                pickle.dump(creds, token)
+        else:
+            if not os.path.exists(CREDENTIALS_JSON_PATH):
+                raise FileNotFoundError(f"Missing {CREDENTIALS_JSON_PATH} to authenticate with Google Drive.")
+            from google_auth_oauthlib.flow import InstalledAppFlow
+            flow = InstalledAppFlow.from_client_secrets_file(
+                CREDENTIALS_JSON_PATH, ['https://www.googleapis.com/auth/drive.file']
+            )
+            creds = flow.run_console()
+            with open(TOKEN_PICKLE_PATH, 'wb') as token:
+                pickle.dump(creds, token)
+
+    return build('drive', 'v3', credentials=creds)
+
+
+def create_or_get_gdrive_folder(service, folder_name, parent_id=None):
+    query = f"mimeType='application/vnd.google-apps.folder' and name='{folder_name}' and trashed=false"
+    if parent_id:
+        query += f" and '{parent_id}' in parents"
+
+    results = service.files().list(q=query, spaces='drive', fields='files(id, name)').execute()
+    items = results.get('files', [])
+    if items:
+        return items[0]['id']
+
+    file_metadata = {
+        'name': folder_name,
+        'mimeType': 'application/vnd.google-apps.folder'
+    }
+    if parent_id:
+        file_metadata['parents'] = [parent_id]
+
+    folder = service.files().create(body=file_metadata, fields='id').execute()
+    return folder.get('id')
+
+
+def upload_to_gdrive(filepath, job_cfg, tags, original_name):
+    """
+    Uploads a file to Google Drive preserving Artist/Album folder structure.
+    Returns the webViewLink of the folder where the file was uploaded, or None if failed.
+    """
+    service = get_gdrive_service()
+
+    artist_raw = tags.get("artist", "")
+    album = sanitize(tags.get("album", "Unknown Album"))
+    raw_aa = tags.get("albumartist", "").strip()
+    album_artist = format_artists(raw_aa) if raw_aa else ""
+    artist = format_artists(artist_raw) if artist_raw else ""
+    folder_artist = first_artist(album_artist or artist) or "Unknown Artist"
+
+    if job_cfg.get("first_artist_only"):
+        folder_artist = first_artist(folder_artist)
+
+    parent_id = None
+    if job_cfg.get("use_artist_subfolders", True):
+        parent_id = create_or_get_gdrive_folder(service, folder_artist, parent_id)
+
+    if job_cfg.get("use_album_subfolders", True):
+        parent_id = create_or_get_gdrive_folder(service, album, parent_id)
+
+    filename = os.path.basename(filepath)
+    ext = os.path.splitext(filename)[1].lower()
+    mime_type = "audio/mpeg" if ext == ".mp3" else "audio/flac" if ext == ".flac" else "audio/mp4"
+
+    file_metadata = {'name': filename}
+    if parent_id:
+        file_metadata['parents'] = [parent_id]
+
+    media = MediaFileUpload(filepath, mimetype=mime_type, resumable=True)
+    file = service.files().create(body=file_metadata, media_body=media, fields='id, webViewLink').execute()
+
+    if parent_id:
+        folder = service.files().get(fileId=parent_id, fields='webViewLink').execute()
+        return folder.get('webViewLink')
+    else:
+        return file.get('webViewLink')
 
 # ─── UTILITIES ─────────────────────────────────────────────────────────
 
@@ -515,6 +611,7 @@ def process_new_files(files_before: set[str], job_cfg: dict):
     function, must be called via asyncio.to_thread."""
     new_files = collect_new_files(files_before)
     organized, duplicates, errors = [], [], []
+    gdrive_links = set()
 
     for f in new_files:
         try:
@@ -529,8 +626,21 @@ def process_new_files(files_before: set[str], job_cfg: dict):
         fmt, bitrate = get_file_info(dest)
         fresh_tags = read_tags(dest)
         if status == "ok":
-            organized.append((name, dest))
-            db_upsert_track(fresh_tags, fmt, bitrate, dest)
+            # Upload to GDrive
+            try:
+                link = upload_to_gdrive(dest, job_cfg, fresh_tags, name)
+                if link:
+                    gdrive_links.add(link)
+                organized.append((name, dest))
+                db_upsert_track(fresh_tags, fmt, bitrate, dest)
+                # Remove file after upload
+                os.remove(dest)
+            except Exception as e:
+                errors.append(f"{name} (Upload error: {e})")
+                try:
+                    os.remove(dest)
+                except Exception:
+                    pass
         elif status == "duplicate_exact":
             duplicates.append(name)
         elif status == "duplicate_different":
@@ -538,7 +648,7 @@ def process_new_files(files_before: set[str], job_cfg: dict):
             db_upsert_track(fresh_tags, fmt, bitrate, dest)
 
     cleanup_empty_dirs()
-    return organized, duplicates, errors
+    return organized, duplicates, errors, list(gdrive_links)
 
 
 # ─── DOWNLOAD ENGINE (AsyncSpotiFLAC as a library) ─────────────────────
@@ -634,13 +744,20 @@ async def safe_edit(chat_id: int, message_id: int, text: str):
             print(f"[!] edit_message error: {e}")
 
 
-async def send_result(chat_id: int, message_id: int, organized, duplicates, errors):
-    lines = ["🎵 <b>Download complete!</b>\n"]
+async def send_result(chat_id: int, message_id: int, organized, duplicates, errors, gdrive_links):
+    lines = ["🎵 <b>Download & Upload complete!</b>\n"]
     if organized:
-        lines.append(f"<b>✅ Downloaded ({len(organized)}):</b>")
+        lines.append(f"<b>✅ Downloaded & Uploaded ({len(organized)}):</b>")
         for name, _ in organized:
             lines.append(f"  • <code>{he(name)}</code>")
         lines.append("")
+
+    if gdrive_links:
+        lines.append("<b>📁 Google Drive Folder(s):</b>")
+        for link in gdrive_links:
+            lines.append(f"  • <a href=\"{link}\">View Folder</a>")
+        lines.append("")
+
     if duplicates:
         lines.append(f"<b>♻️ Already in library ({len(duplicates)}):</b>")
         for name in duplicates:
@@ -655,20 +772,7 @@ async def send_result(chat_id: int, message_id: int, organized, duplicates, erro
         await bot.delete_message(chat_id, message_id)
     except Exception:
         pass
-    await bot.send_message(chat_id, "\n".join(lines)[:4000])
-
-    for name, path in organized:
-        size = os.path.getsize(path)
-        if size > MAX_TELEGRAM_UPLOAD_BYTES:
-            await bot.send_message(
-                chat_id,
-                f"'{he(name)}' is {size / 1024 / 1024:.1f} MB, too large for Telegram (50 MB limit).",
-            )
-            continue
-        try:
-            await bot.send_audio(chat_id=chat_id, audio=FSInputFile(path))
-        except Exception as e:
-            await bot.send_message(chat_id, f"Could not send '{he(name)}': {he(e)}")
+    await bot.send_message(chat_id, "\n".join(lines)[:4000], disable_web_page_preview=True)
 
 
 async def download_worker():
@@ -686,7 +790,7 @@ async def download_worker():
 
             await run_spotiflac(job["url"], job)
 
-            organized, duplicates, errors = await asyncio.to_thread(
+            organized, duplicates, errors, gdrive_links = await asyncio.to_thread(
                 process_new_files,
                 files_before,
                 job,
@@ -700,7 +804,7 @@ async def download_worker():
                 )
             else:
                 await send_result(
-                    job["chat_id"], job["message_id"], organized, duplicates, errors
+                    job["chat_id"], job["message_id"], organized, duplicates, errors, gdrive_links
                 )
 
         except Exception as e:

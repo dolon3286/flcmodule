@@ -365,6 +365,44 @@ class SignedSessionClient:
         parts[4] = urlencode(query)
         return urlunparse(parts)
 
+
+    async def authenticate_with_manual_grant(
+        self,
+        on_verification_url: Callable[[str], None],
+        grant_input: Callable[[], str],
+        timeout: float = 300,
+    ) -> None:
+        boot_result = await self.bootstrap()
+        if boot_result is True:
+            return
+
+        if not self.pending_challenge_id:
+            raise RuntimeError("bootstrap() non ha restituito challenge_id")
+
+        challenge_url = self._build_challenge_url_with_callback(
+            self.pending_challenge_id,
+            dummy_callback="http://127.0.0.1:3000/session-grant",
+        )
+        on_verification_url(challenge_url)
+
+        import asyncio
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
+        grant = ""
+        while loop.time() < deadline:
+            try:
+                grant = await loop.run_in_executor(None, grant_input)
+            except Exception:
+                grant = ""
+            if grant:
+                break
+            await asyncio.sleep(0.5)
+
+        if not grant:
+            raise TimeoutError("timeout attesa grant manuale")
+
+        await self.exchange_grant(grant)
+
     async def authenticate_with_turnstile(
         self,
         timeout: float = 60,
@@ -869,7 +907,17 @@ async def perform_signed_fetch(
                             client.namespace,
                             exc,
                         )
-                        return {"error": str(exc)}
+                        if on_verification_url and grant_input:
+                            try:
+                                await client.authenticate_with_manual_grant(
+                                    on_verification_url=on_verification_url,
+                                    grant_input=grant_input,
+                                    timeout=timeout,
+                                )
+                            except Exception as manual_exc:
+                                return {"error": str(manual_exc)}
+                        else:
+                            return {"error": str(exc)}
 
         # A questo punto la sessione è garantita per tutte le tracce parallele
         resp = await client.request(method, path, json_body=body, extra_headers=headers)

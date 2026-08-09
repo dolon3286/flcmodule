@@ -31,9 +31,9 @@ _MAX_RELOAD_ATTEMPTS = 3
 _DEBUG_VISIBLE = os.environ.get("TS_DEBUG_VISIBLE", "").strip() == "1"
 
 
-_docker_flags = []
+_docker_flags = ["--no-sandbox", "--disable-dev-shm-usage"]
 if os.name != "nt" and hasattr(os, "geteuid") and os.geteuid() == 0:
-    _docker_flags = ["--no-sandbox", "--disable-dev-shm-usage"]
+    pass # we always add them to avoid permission issues and memory crashes in containers
 
 
 def _patch_nodriver_unknown_cdp_events() -> None:
@@ -354,17 +354,23 @@ def build_chromium_options(*, hidden: bool = True) -> ChromiumOptions:
 
     options = ChromiumOptions()
     options.binary_location = _find_chrome()
-    options.headless = False
+    options.headless = True
+
+    # We clear the profile in headless mode to prevent pydoll startup errors on linux
+    import shutil
+    import os
+    profile_dir = _get_profile_dir()
+    if os.path.exists(profile_dir):
+        try:
+            shutil.rmtree(profile_dir)
+        except Exception:
+            pass
+
     # A persistent profile dir. pydoll doesn't have a first-class
     # `user_data_dir` option (yet), so it's passed as a raw Chromium flag,
     # same as nodriver did internally.
-    options.add_argument(f"--user-data-dir={_get_profile_dir()}")
+    options.add_argument(f"--user-data-dir={profile_dir}")
     options.add_argument("--window-size=1280,900")
-    if hidden and not debug_visible:
-        # Push the (non-headless) window off-screen instead of using
-        # --headless: a fully headless browser is more likely to be
-        # challenged by Cloudflare than a real, visible-but-offscreen one.
-        options.add_argument("--window-position=-32000,-32000")
     for flag in _docker_flags:
         options.add_argument(flag)
 
