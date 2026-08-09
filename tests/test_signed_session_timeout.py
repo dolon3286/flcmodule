@@ -18,6 +18,7 @@ class DummyClient:
 
     async def authenticate_with_manual_grant(self, **kwargs) -> None:
         self.calls.append(kwargs)
+        self.authenticated = True
 
     async def request(self, method, path, json_body=None, extra_headers=None):
         return SimpleNamespace(
@@ -31,10 +32,12 @@ class DummyClient:
 def test_perform_signed_fetch_forwards_timeout_to_manual_grant() -> None:
     async def run_test() -> None:
         client = DummyClient()
-        result = await perform_signed_fetch(client, "GET", "/x", None, None, timeout=42)
+        def dummy_url(u): pass
+        def dummy_grant(): return ""
+        result = await perform_signed_fetch(client, "GET", "/x", None, None, on_verification_url=dummy_url, grant_input=dummy_grant, timeout=42)
         assert result["statusCode"] == 200
         assert client.calls == [
-            {"on_verification_url": None, "grant_input": None, "timeout": 42},
+            {"on_verification_url": dummy_url, "grant_input": dummy_grant, "timeout": 42},
         ]
 
     asyncio.run(run_test())
